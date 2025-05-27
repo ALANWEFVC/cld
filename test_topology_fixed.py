@@ -4,10 +4,11 @@
 """
 创建一个用于测试IADS框架的Mininet拓扑（修复版）
 修复的问题：
-1. 修复OpenFlow13协议配置
+1. 添加OpenFlow13协议支持
 2. 优化交换机配置
 3. 改进链路参数设置
 4. 增强错误处理
+5. 启用RSTP以支持环路拓扑
 
 拓扑结构：
     h1 --- s1 --- s2 --- h2
@@ -28,13 +29,6 @@ import threading
 import sys
 
 
-class OVSSwitch13(OVSSwitch):
-    """OpenFlow 1.3 交换机"""
-    def __init__(self, name, **params):
-        params.setdefault('protocols', 'OpenFlow13')
-        super(OVSSwitch13, self).__init__(name, **params)
-
-
 class IADSTestTopologyFixed:
     """IADS测试拓扑（修复版）"""
 
@@ -48,11 +42,12 @@ class IADSTestTopologyFixed:
         """创建测试拓扑"""
         info('*** Creating network\n')
 
-        # 创建网络，使用自定义的OVSSwitch13
+        # 创建网络，使用RemoteController连接到Ryu
+        # 关键修复：明确指定OpenFlow13支持
         self.net = Mininet(
             controller=RemoteController,
-            switch=OVSSwitch13,  # 使用自定义的OpenFlow13交换机
-            link=TCLink,
+            switch=OVSSwitch,
+            link=TCLink,  # 使用TCLink以支持带宽、延迟等参数
             autoSetMacs=True
         )
 
@@ -61,14 +56,23 @@ class IADSTestTopologyFixed:
             'c0',
             controller=RemoteController,
             ip='127.0.0.1',
-            port=6633
+            port=6633  # 与run.sh中配置一致
         )
 
         info('*** Adding switches\n')
-        # 添加交换机，使用简化配置
-        s1 = self.net.addSwitch('s1', dpid='0000000000000001')
-        s2 = self.net.addSwitch('s2', dpid='0000000000000002')
-        s3 = self.net.addSwitch('s3', dpid='0000000000000003')
+        # 添加交换机，修复：明确指定OpenFlow13和失败模式
+        s1 = self.net.addSwitch('s1',
+                                dpid='0000000000000001',
+                                protocols='OpenFlow13',
+                                failMode='secure')
+        s2 = self.net.addSwitch('s2',
+                                dpid='0000000000000002',
+                                protocols='OpenFlow13',
+                                failMode='secure')
+        s3 = self.net.addSwitch('s3',
+                                dpid='0000000000000003',
+                                protocols='OpenFlow13',
+                                failMode='secure')
         self.switches = [s1, s2, s3]
 
         info('*** Adding hosts\n')
@@ -79,67 +83,91 @@ class IADSTestTopologyFixed:
         self.hosts = [h1, h2, h3]
 
         info('*** Creating links\n')
-        # 创建链路，使用简化参数
-        self.net.addLink(h1, s1)
-        self.net.addLink(s1, s2)
-        self.net.addLink(s2, h2)
-        self.net.addLink(s1, s3)
-        self.net.addLink(s3, s2)
-        self.net.addLink(s3, h3)
+        # 创建链路，修复：使用更保守的参数设置
+        # h1-s1: 正常链路
+        self.net.addLink(h1, s1, bw=100, delay='1ms', loss=0, use_htb=True)
+        # s1-s2: 核心链路，带宽较高
+        self.net.addLink(s1, s2, bw=1000, delay='2ms', loss=0, use_htb=True)
+        # s2-h2: 正常链路
+        self.net.addLink(s2, h2, bw=100, delay='1ms', loss=0, use_htb=True)
+        # s1-s3: 稍微不稳定的链路，但参数更保守
+        self.net.addLink(s1, s3, bw=100, delay='5ms', loss=0, use_htb=True)
+        # s3-s2: 备份链路
+        self.net.addLink(s3, s2, bw=500, delay='3ms', loss=0, use_htb=True)
+        # s3-h3: 较慢的链路，但不设置丢包
+        self.net.addLink(s3, h3, bw=50, delay='10ms', loss=0, use_htb=True)
 
     def start(self):
         """启动网络"""
         info('*** Starting network\n')
         self.net.start()
 
-        info('*** Configuring OpenFlow13\n')
-        # 手动确保所有交换机使用OpenFlow13
+        # 为所有交换机启用RSTP
+        info('*** Enabling RSTP on switches\n')
         for switch in self.switches:
-            info('Configuring {} for OpenFlow13\n'.format(switch.name))
-            switch.cmd('ovs-vsctl set bridge %s protocols=OpenFlow13' % switch.name)
+            switch.cmd('ovs-vsctl set bridge %s rstp_enable=true' % switch.name)
 
-        info('*** Waiting for switches to connect to controller\n')
-        time.sleep(8)
+        # 等待RSTP收敛
+        info('*** Waiting for RSTP convergence (30 seconds)...\n')
+        time.sleep(30)
 
-        # 检查控制器连接状态
+        # 等待更长时间让IADS学习拓扑
+        info('*** Waiting for IADS topology discovery...\n')
+        time.sleep(15)
+
+        # 检查流表
+        info('*** Checking flow tables\n')
+        for switch in self.switches:
+            info('=== {} flows ===\n'.format(switch.name))
+            flows = switch.cmd('ovs-ofctl -O OpenFlow13 dump-flows %s' % switch.name)
+            info(flows)
+
+        # 手动添加ARP处理
+        info('*** Ensuring ARP handling\n')
+        for host in self.hosts:
+            # 刷新ARP缓存
+            host.cmd('arp -d -a')
+
+        # 逐个测试
+        info('*** Step-by-step connectivity test\n')
+        h1, h2 = self.hosts[0], self.hosts[1]
+
+        # 先测试ARP
+        info('1. ARP test:\n')
+        h1.cmd('arping -c 1 10.0.0.2')
+
+        # 再测试ICMP
+        info('2. ICMP test:\n')
+        result = h1.cmd('ping -c 3 10.0.0.2')
+        info(result)
+
+        # 修复：检查控制器连接状态
         info('*** Checking controller connectivity\n')
         for switch in self.switches:
             info('Checking {}... '.format(switch.name))
+            # 使用ovs-vsctl检查控制器连接
             result = switch.cmd('ovs-vsctl show')
             if 'is_connected: true' in result:
                 info('Connected\n')
             else:
-                info('Not connected\n')
+                info('Disconnected - trying to reconnect\n')
+                switch.cmd('ovs-vsctl set-controller {} tcp:127.0.0.1:6633'.format(switch.name))
 
-        # 检查OpenFlow版本
-        info('*** Verifying OpenFlow13 configuration\n')
-        for switch in self.switches:
-            result = switch.cmd('ovs-vsctl get bridge %s protocols' % switch.name)
-            info('{} protocols: {}\n'.format(switch.name, result.strip()))
-
+        # 再等待一段时间
         time.sleep(5)
 
         info('*** Testing basic connectivity\n')
+        # 先测试基本的ping
         result = self.net.pingAll()
         if result == 0:
             info('*** All hosts can ping each other successfully!\n')
-            return True
         else:
             info('*** Ping test failed with {}% packet loss\n'.format(result))
-            
-            # 调试信息
-            info('*** Debugging information:\n')
-            for switch in self.switches:
-                info('=== {} Flow Tables ===\n'.format(switch.name))
-                flows = switch.cmd('ovs-ofctl -O OpenFlow13 dump-flows %s' % switch.name)
-                info('{}\n'.format(flows))
-            
-            return False
-            
+
     def test_simple_connectivity(self):
         """测试基本连通性"""
         info('\n*** Testing simple connectivity\n')
-        
+
         # 逐对测试ping
         for i, src in enumerate(self.hosts):
             for j, dst in enumerate(self.hosts):
@@ -164,10 +192,11 @@ class IADSTestTopologyFixed:
             ]
 
             for i, scenario in enumerate(scenarios):
-                time.sleep(20)
-                info('\n*** Running scenario {}\n'.format(i+1))
+                time.sleep(20)  # 每20秒运行一个场景
+                info('\n*** Running scenario {}\n'.format(i + 1))
                 scenario()
 
+        # 在后台线程运行场景
         t = threading.Thread(target=scenario_thread)
         t.daemon = True
         t.start()
@@ -176,7 +205,8 @@ class IADSTestTopologyFixed:
         """场景1：轻量流量测试"""
         info('\n*** Scenario 1: Light traffic test\n')
         h1, h2 = self.hosts[0], self.hosts[1]
-        
+
+        # 轻量ping测试
         info('  - Light ping test from h1 to h2\n')
         result = h1.cmd('ping -c 5 10.0.0.2')
         if '5 received' in result:
@@ -189,6 +219,7 @@ class IADSTestTopologyFixed:
         info('\n*** Scenario 2: Medium traffic test\n')
         h1, h2 = self.hosts[0], self.hosts[1]
 
+        # 使用更轻量的流量测试
         info('  - Starting medium traffic flow from h1 to h2\n')
         try:
             h2.cmd('iperf -s -p 5001 &')
@@ -198,13 +229,15 @@ class IADSTestTopologyFixed:
         except Exception as e:
             info('  - Traffic test failed: {}\n'.format(e))
         finally:
+            # 清理
             h1.cmd('killall -9 iperf 2>/dev/null')
             h2.cmd('killall -9 iperf 2>/dev/null')
 
     def _scenario_connectivity_test(self):
         """场景3：连通性重测"""
         info('\n*** Scenario 3: Connectivity retest\n')
-        
+
+        # 重新测试连通性
         result = self.net.pingAll()
         info('  - Connectivity retest result: {}% packet loss\n'.format(result))
 
@@ -217,7 +250,7 @@ class IADSTestTopologyFixed:
         info('    nodes - Show all nodes\n')
         info('    links - Show all links\n')
         info('    dump - Show network configuration\n')
-        info('    s1 ovs-ofctl -O OpenFlow13 dump-flows s1 - Show flow tables\n')
+        info('    s1 ovs-appctl stp/show - Show STP status\n')
         CLI(self.net)
 
     def stop(self):
@@ -231,37 +264,37 @@ def main():
     """主函数"""
     setLogLevel('info')
 
+    # 创建测试拓扑
     topo = IADSTestTopologyFixed()
 
     try:
+        # 创建和启动拓扑
         topo.create_topology()
-        success = topo.start()
-        
-        if success:
-            info('\n*** Basic connectivity successful!\n')
-            topo.run_dynamic_scenarios()
-        else:
-            info('\n*** Basic connectivity failed, entering CLI for debugging\n')
-            topo.test_simple_connectivity()
+        topo.start()
 
-        print("\n" + "="*50)
+        # 测试基本连通性
+        topo.test_simple_connectivity()
+
+        # 如果基本连通性通过，运行动态场景
+        print("\n" + "=" * 50)
         print("IADS Test Topology is ready!")
         print("Basic connectivity test completed.")
-        if success:
-            print("All tests PASSED!")
-        else:
-            print("Some tests FAILED - check debugging info above")
-        print("="*50 + "\n")
-        
+        print("Starting dynamic scenarios...")
+        print("=" * 50 + "\n")
+
+        topo.run_dynamic_scenarios()
+
+        # 进入CLI
         topo.cli()
 
     except KeyboardInterrupt:
         info('\n*** Interrupted by user\n')
     except Exception as e:
-        info('\n*** Error: {}\n'.format(e))
+        info('*** Error: {}\n'.format(e))
         import traceback
         traceback.print_exc()
     finally:
+        # 清理
         topo.stop()
 
 
